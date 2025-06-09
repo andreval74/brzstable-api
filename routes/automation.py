@@ -1,299 +1,484 @@
 from flask import Blueprint, jsonify, request
 from web3 import Web3
 import json
-import os
+import requests
+import time
 import logging
 from datetime import datetime
 
-automation_bp = Blueprint("automation", __name__)
+# Blueprint para rotas de automação multi-rede
+automation_bp = Blueprint('automation', __name__)
 
-# Configurar logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Configuração Web3 para BSC Testnet
+BSC_TESTNET_RPC = "https://data-seed-prebsc-1-s1.bnbchain.org:8545"
+w3 = Web3(Web3.HTTPProvider(BSC_TESTNET_RPC))
 
-# Configuração da conexão com a blockchain
-def get_web3_connection():
-    """Obtém conexão com a blockchain BSC"""
-    try:
-        rpc_url = os.environ.get('BSC_RPC_URL', 'https://data-seed-prebsc-1-s1.bnbchain.org:8545')
-        w3 = Web3(Web3.HTTPProvider(rpc_url))
-        return w3
-    except Exception as e:
-        logger.error(f"Erro ao conectar com BSC: {str(e)}")
-        return None
+# Endereços dos contratos (serão atualizados quando você implantar)
+CONTRACTS = {
+    "MOCKUSDT": "0x5Fc088c2890fAB8c481cFB6D0d16f15A7f75c760",
+    "BRZSTABLE": "0xA991a6642ee368683A8308D79a3B6a46c535D851",
+    "MULTI_LIQUIDITY_MANAGER": "0x0000000000000000000000000000000000000000",  # Será atualizado
+    "STABLECOIN_FACTORY": "0x0000000000000000000000000000000000000000"      # Será atualizado
+}
 
-# Endereços dos contratos
-BRZSTABLE_ADDRESS = os.environ.get('BRZSTABLE_ADDRESS')
-MOCKUSDT_ADDRESS = os.environ.get('MOCKUSDT_ADDRESS')
-
-# ABIs dos contratos (simplificados)
-BRZSTABLE_ABI = [
+# ABIs simplificadas
+ERC20_ABI = [
     {
+        "constant": True,
         "inputs": [],
         "name": "totalSupply",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
+        "outputs": [{"name": "", "type": "uint256"}],
         "type": "function"
     },
     {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
         "inputs": [],
-        "name": "getUSDTBalance",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
+        "name": "name",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{"name": "", "type": "string"}],
+        "type": "function"
+    },
+    {
+        "constant": True,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{"name": "", "type": "uint8"}],
         "type": "function"
     }
 ]
 
-MOCKUSDT_ABI = [
+LIQUIDITY_MANAGER_ABI = [
     {
-        "inputs": [],
-        "name": "totalSupply",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
+        "inputs": [
+            {"name": "tokenA", "type": "address"},
+            {"name": "tokenB", "type": "address"},
+            {"name": "amountA", "type": "uint256"},
+            {"name": "amountB", "type": "uint256"}
+        ],
+        "name": "createPool",
+        "outputs": [{"name": "poolId", "type": "bytes32"}],
         "type": "function"
     },
     {
-        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
-        "name": "balanceOf",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
+        "inputs": [{"name": "poolId", "type": "bytes32"}],
+        "name": "getPoolInfo",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "tokenA", "type": "address"},
+                    {"name": "tokenB", "type": "address"},
+                    {"name": "pairAddress", "type": "address"},
+                    {"name": "liquidityAmount", "type": "uint256"},
+                    {"name": "isActive", "type": "bool"},
+                    {"name": "createdAt", "type": "uint256"},
+                    {"name": "networkId", "type": "uint256"}
+                ],
+                "name": "",
+                "type": "tuple"
+            }
+        ],
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getAllPoolIds",
+        "outputs": [{"name": "", "type": "bytes32[]"}],
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "poolId", "type": "bytes32"},
+            {"name": "priceOfTokenA", "type": "bool"}
+        ],
+        "name": "getTokenPrice",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "type": "function"
+    }
+]
+
+STABLECOIN_FACTORY_ABI = [
+    {
+        "inputs": [
+            {"name": "name", "type": "string"},
+            {"name": "symbol", "type": "string"},
+            {"name": "collateralToken", "type": "address"},
+            {"name": "initialSupply", "type": "uint256"},
+            {"name": "collateralRatio", "type": "uint256"},
+            {"name": "initialLiquidityA", "type": "uint256"},
+            {"name": "initialLiquidityB", "type": "uint256"}
+        ],
+        "name": "createStablecoin",
+        "outputs": [{"name": "stablecoinId", "type": "bytes32"}],
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getAllStablecoinIds",
+        "outputs": [{"name": "", "type": "bytes32[]"}],
+        "type": "function"
+    },
+    {
+        "inputs": [{"name": "stablecoinId", "type": "bytes32"}],
+        "name": "getStablecoinInfo",
+        "outputs": [
+            {
+                "components": [
+                    {"name": "stablecoinAddress", "type": "address"},
+                    {"name": "liquidityManagerAddress", "type": "address"},
+                    {"name": "poolId", "type": "bytes32"},
+                    {
+                        "components": [
+                            {"name": "name", "type": "string"},
+                            {"name": "symbol", "type": "string"},
+                            {"name": "collateralToken", "type": "address"},
+                            {"name": "initialSupply", "type": "uint256"},
+                            {"name": "collateralRatio", "type": "uint256"},
+                            {"name": "isActive", "type": "bool"},
+                            {"name": "createdAt", "type": "uint256"}
+                        ],
+                        "name": "config",
+                        "type": "tuple"
+                    }
+                ],
+                "name": "",
+                "type": "tuple"
+            }
+        ],
         "type": "function"
     }
 ]
 
 def get_contract_instance(address, abi):
-    """Obtém instância do contrato"""
+    """Cria instância de contrato Web3"""
     try:
-        w3 = get_web3_connection()
-        if not w3 or not w3.is_connected():
+        if address == "0x0000000000000000000000000000000000000000":
             return None
-        return w3.eth.contract(address=address, abi=abi)
+        return w3.eth.contract(address=Web3.to_checksum_address(address), abi=abi)
     except Exception as e:
-        logger.error(f"Erro ao obter instância do contrato {address}: {str(e)}")
+        logging.error(f"Erro ao criar instância do contrato {address}: {e}")
         return None
 
-@automation_bp.route("/status", methods=["GET"])
+def get_token_info(token_address):
+    """Obtém informações básicas de um token ERC20"""
+    try:
+        contract = get_contract_instance(token_address, ERC20_ABI)
+        if not contract:
+            return None
+            
+        return {
+            "address": token_address,
+            "name": contract.functions.name().call(),
+            "symbol": contract.functions.symbol().call(),
+            "decimals": contract.functions.decimals().call(),
+            "totalSupply": contract.functions.totalSupply().call()
+        }
+    except Exception as e:
+        logging.error(f"Erro ao obter informações do token {token_address}: {e}")
+        return None
+
+@automation_bp.route('/status', methods=['GET'])
 def get_status():
-    """Retorna o status atual da stablecoin"""
+    """Status geral do sistema multi-rede"""
     try:
-        # Verificar se os endereços dos contratos estão configurados
-        if not BRZSTABLE_ADDRESS or not MOCKUSDT_ADDRESS:
-            return jsonify({
-                "success": False,
-                "error": "Endereços dos contratos não configurados"
-            }), 500
-
-        # Obter instâncias dos contratos
-        brzstable_contract = get_contract_instance(BRZSTABLE_ADDRESS, BRZSTABLE_ABI)
+        # Informações básicas da rede
+        latest_block = w3.eth.block_number
         
-        if not brzstable_contract:
-            return jsonify({
-                "success": False,
-                "error": "Não foi possível conectar com o contrato BRZStable"
-            }), 500
-
-        # Obter informações dos contratos
-        try:
-            brzstable_supply = brzstable_contract.functions.totalSupply().call()
-            usdt_reserves = brzstable_contract.functions.getUSDTBalance().call()
-        except Exception as e:
-            logger.error(f"Erro ao chamar funções do contrato: {str(e)}")
-            # Retornar dados simulados em caso de erro
-            brzstable_supply = 1000000 * 10**18  # 1M tokens
-            usdt_reserves = 1000000 * 10**6      # 1M USDT
+        # Informações dos tokens principais
+        mockusdt_info = get_token_info(CONTRACTS["MOCKUSDT"])
+        brzstable_info = get_token_info(CONTRACTS["BRZSTABLE"])
         
-        # Calcular a razão de colateralização
-        if brzstable_supply > 0:
-            # Converter para mesma base (18 decimais)
-            usdt_reserves_18 = usdt_reserves * 10**12  # USDT tem 6 decimais, converter para 18
-            collateral_ratio = (usdt_reserves_18 / brzstable_supply) * 100
-        else:
-            collateral_ratio = 0
+        # Status dos contratos de gerenciamento
+        liquidity_manager = get_contract_instance(CONTRACTS["MULTI_LIQUIDITY_MANAGER"], LIQUIDITY_MANAGER_ABI)
+        factory = get_contract_instance(CONTRACTS["STABLECOIN_FACTORY"], STABLECOIN_FACTORY_ABI)
         
         return jsonify({
-            "success": True,
-            "data": {
-                "brzstable_supply": brzstable_supply / 10**18,  # Converter para tokens
-                "usdt_reserves": usdt_reserves / 10**6,         # Converter para USDT
-                "collateral_ratio": round(collateral_ratio, 2),
-                "is_stable": collateral_ratio >= 100,
-                "timestamp": datetime.utcnow().isoformat(),
-                "contracts": {
-                    "brzstable": BRZSTABLE_ADDRESS,
-                    "mockusdt": MOCKUSDT_ADDRESS
+            "status": "success",
+            "network": {
+                "name": "BSC Testnet",
+                "chainId": 97,
+                "latestBlock": latest_block,
+                "rpcUrl": BSC_TESTNET_RPC
+            },
+            "contracts": {
+                "mockUSDT": mockusdt_info,
+                "brzStable": brzstable_info,
+                "liquidityManager": {
+                    "address": CONTRACTS["MULTI_LIQUIDITY_MANAGER"],
+                    "isDeployed": liquidity_manager is not None
+                },
+                "stablecoinFactory": {
+                    "address": CONTRACTS["STABLECOIN_FACTORY"],
+                    "isDeployed": factory is not None
                 }
-            }
+            },
+            "timestamp": datetime.now().isoformat()
         })
-    except Exception as e:
-        logger.error(f"Erro em get_status: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Erro interno: {str(e)}"
-        }), 500
-
-@automation_bp.route("/price", methods=["GET"])
-def get_price():
-    """Simula a obtenção do preço da stablecoin de exchanges"""
-    try:
-        import random
         
-        # Simular pequenas variações de preço
+    except Exception as e:
+        logging.error(f"Erro ao obter status: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@automation_bp.route('/pools', methods=['GET'])
+def get_all_pools():
+    """Lista todos os pools de liquidez"""
+    try:
+        liquidity_manager = get_contract_instance(CONTRACTS["MULTI_LIQUIDITY_MANAGER"], LIQUIDITY_MANAGER_ABI)
+        
+        if not liquidity_manager:
+            return jsonify({
+                "status": "error",
+                "message": "Liquidity Manager não implantado"
+            }), 400
+        
+        # Obter todos os IDs de pools
+        pool_ids = liquidity_manager.functions.getAllPoolIds().call()
+        
+        pools = []
+        for pool_id in pool_ids:
+            try:
+                pool_info = liquidity_manager.functions.getPoolInfo(pool_id).call()
+                
+                # Obter informações dos tokens
+                token_a_info = get_token_info(pool_info[0])
+                token_b_info = get_token_info(pool_info[1])
+                
+                # Obter preço atual
+                try:
+                    price = liquidity_manager.functions.getTokenPrice(pool_id, True).call()
+                    price_formatted = price / 1e18
+                except:
+                    price_formatted = 0
+                
+                pools.append({
+                    "poolId": pool_id.hex(),
+                    "tokenA": token_a_info,
+                    "tokenB": token_b_info,
+                    "pairAddress": pool_info[2],
+                    "liquidityAmount": pool_info[3],
+                    "isActive": pool_info[4],
+                    "createdAt": pool_info[5],
+                    "networkId": pool_info[6],
+                    "currentPrice": price_formatted
+                })
+                
+            except Exception as e:
+                logging.error(f"Erro ao processar pool {pool_id.hex()}: {e}")
+                continue
+        
+        return jsonify({
+            "status": "success",
+            "pools": pools,
+            "totalPools": len(pools)
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao obter pools: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@automation_bp.route('/stablecoins', methods=['GET'])
+def get_all_stablecoins():
+    """Lista todas as stablecoins criadas"""
+    try:
+        factory = get_contract_instance(CONTRACTS["STABLECOIN_FACTORY"], STABLECOIN_FACTORY_ABI)
+        
+        if not factory:
+            return jsonify({
+                "status": "error",
+                "message": "Stablecoin Factory não implantado"
+            }), 400
+        
+        # Obter todos os IDs de stablecoins
+        stablecoin_ids = factory.functions.getAllStablecoinIds().call()
+        
+        stablecoins = []
+        for stablecoin_id in stablecoin_ids:
+            try:
+                stablecoin_info = factory.functions.getStablecoinInfo(stablecoin_id).call()
+                
+                # Obter informações do token
+                token_info = get_token_info(stablecoin_info[0])
+                
+                stablecoins.append({
+                    "stablecoinId": stablecoin_id.hex(),
+                    "address": stablecoin_info[0],
+                    "liquidityManagerAddress": stablecoin_info[1],
+                    "poolId": stablecoin_info[2].hex(),
+                    "tokenInfo": token_info,
+                    "config": {
+                        "name": stablecoin_info[3][0],
+                        "symbol": stablecoin_info[3][1],
+                        "collateralToken": stablecoin_info[3][2],
+                        "initialSupply": stablecoin_info[3][3],
+                        "collateralRatio": stablecoin_info[3][4],
+                        "isActive": stablecoin_info[3][5],
+                        "createdAt": stablecoin_info[3][6]
+                    }
+                })
+                
+            except Exception as e:
+                logging.error(f"Erro ao processar stablecoin {stablecoin_id.hex()}: {e}")
+                continue
+        
+        return jsonify({
+            "status": "success",
+            "stablecoins": stablecoins,
+            "totalStablecoins": len(stablecoins)
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao obter stablecoins: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@automation_bp.route('/price/<token_address>', methods=['GET'])
+def get_token_price(token_address):
+    """Obtém preço de um token específico"""
+    try:
+        # Simular preço baseado em USDT com pequena variação
         base_price = 1.0
-        variation = random.uniform(-0.02, 0.02)  # Variação de ±2%
-        current_price = base_price + variation
+        variation = (time.time() % 100) / 10000  # Variação de ±0.01
+        current_price = base_price + (variation - 0.005)
+        
+        # Calcular desvio percentual
+        deviation = ((current_price - base_price) / base_price) * 100
         
         return jsonify({
-            "success": True,
-            "data": {
-                "price_usdt": round(current_price, 6),
-                "target_price": 1.0,
-                "deviation": round(abs(current_price - 1.0), 6),
-                "needs_arbitrage": abs(current_price - 1.0) > 0.01,  # Se desvio > 1%
-                "timestamp": datetime.utcnow().isoformat(),
-                "source": "simulated"
-            }
-        })
-    except Exception as e:
-        logger.error(f"Erro em get_price: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Erro interno: {str(e)}"
-        }), 500
-
-@automation_bp.route("/arbitrage", methods=["POST"])
-def execute_arbitrage():
-    """Executa operações de arbitragem para manter a paridade"""
-    try:
-        data = request.get_json() or {}
-        action = data.get("action")  # "buy" ou "sell"
-        amount = data.get("amount", 0)
-        
-        if action not in ["buy", "sell"]:
-            return jsonify({
-                "success": False,
-                "error": "Ação inválida. Use 'buy' ou 'sell'."
-            }), 400
-        
-        if amount <= 0:
-            return jsonify({
-                "success": False,
-                "error": "Quantidade deve ser maior que zero."
-            }), 400
-        
-        # Simular a operação de arbitragem
-        if action == "buy":
-            operation = f"Comprar {amount} BRZStable no mercado e resgatar por USDT"
-        else:
-            operation = f"Cunhar {amount} BRZStable com USDT e vender no mercado"
-        
-        return jsonify({
-            "success": True,
-            "data": {
-                "operation": operation,
-                "amount": amount,
-                "action": action,
-                "status": "simulated",
-                "timestamp": datetime.utcnow().isoformat(),
-                "message": "Operação de arbitragem simulada com sucesso"
-            }
+            "status": "success",
+            "tokenAddress": token_address,
+            "price": {
+                "current": round(current_price, 6),
+                "target": base_price,
+                "deviation": round(deviation, 3),
+                "currency": "USDT"
+            },
+            "timestamp": datetime.now().isoformat()
         })
         
     except Exception as e:
-        logger.error(f"Erro em execute_arbitrage: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Erro interno: {str(e)}"
-        }), 500
+        logging.error(f"Erro ao obter preço: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@automation_bp.route("/liquidity", methods=["GET"])
-def get_liquidity():
-    """Retorna informações sobre liquidez em exchanges"""
+@automation_bp.route('/arbitrage/opportunities', methods=['GET'])
+def get_arbitrage_opportunities():
+    """Detecta oportunidades de arbitragem"""
     try:
-        # Simular dados de liquidez de diferentes exchanges
-        liquidity_data = {
-            "pancakeswap_v3": {
-                "pool_address": "0x...",
-                "liquidity_usdt": 50000,
-                "volume_24h": 12000,
-                "fee_tier": 0.05
-            },
-            "biswap": {
-                "pool_address": "0x...",
-                "liquidity_usdt": 25000,
-                "volume_24h": 8000,
-                "fee_tier": 0.30
-            },
-            "total_liquidity": 75000,
-            "total_volume_24h": 20000,
-            "timestamp": datetime.utcnow().isoformat(),
-            "source": "simulated"
+        opportunities = []
+        
+        # Simular oportunidades de arbitragem
+        if time.time() % 30 < 10:  # 1/3 do tempo há oportunidades
+            opportunities.append({
+                "poolId": "0x1234567890abcdef",
+                "tokenPair": "BRZ/USDT",
+                "priceDeviation": 0.15,
+                "potentialProfit": 0.08,
+                "recommendedAction": "buy_brz",
+                "urgency": "medium"
+            })
+        
+        return jsonify({
+            "status": "success",
+            "opportunities": opportunities,
+            "totalOpportunities": len(opportunities),
+            "lastCheck": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao detectar arbitragem: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@automation_bp.route('/monitor/system', methods=['GET'])
+def monitor_system():
+    """Monitoramento geral do sistema"""
+    try:
+        # Status da conexão blockchain
+        latest_block = w3.eth.block_number
+        
+        # Simular métricas do sistema
+        system_metrics = {
+            "uptime": "99.8%",
+            "totalTransactions": 1247,
+            "totalVolume": 125430.50,
+            "activeArbitrages": 3,
+            "systemHealth": "excellent"
         }
         
         return jsonify({
-            "success": True,
-            "data": liquidity_data
+            "status": "success",
+            "blockchain": {
+                "connected": True,
+                "latestBlock": latest_block,
+                "network": "BSC Testnet"
+            },
+            "metrics": system_metrics,
+            "alerts": [],
+            "timestamp": datetime.now().isoformat()
         })
+        
     except Exception as e:
-        logger.error(f"Erro em get_liquidity: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": f"Erro interno: {str(e)}"
-        }), 500
+        logging.error(f"Erro no monitoramento: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@automation_bp.route("/monitor", methods=["GET"])
-def monitor_system():
-    """Monitora o sistema e retorna alertas se necessário"""
+@automation_bp.route('/contracts/update', methods=['POST'])
+def update_contract_addresses():
+    """Atualiza endereços dos contratos"""
     try:
-        alerts = []
+        data = request.get_json()
         
-        # Verificar conectividade com BSC
-        w3 = get_web3_connection()
-        if not w3 or not w3.is_connected():
-            alerts.append({
-                "type": "error",
-                "message": "Conexão com BSC perdida",
-                "severity": "high",
-                "timestamp": datetime.utcnow().isoformat()
-            })
+        if 'liquidityManager' in data:
+            CONTRACTS["MULTI_LIQUIDITY_MANAGER"] = data['liquidityManager']
         
-        # Verificar configuração dos contratos
-        if not BRZSTABLE_ADDRESS or not MOCKUSDT_ADDRESS:
-            alerts.append({
-                "type": "warning",
-                "message": "Endereços dos contratos não configurados",
-                "severity": "high",
-                "timestamp": datetime.utcnow().isoformat()
-            })
-        
-        # Simular verificação de reservas baixas
-        import random
-        if random.random() < 0.1:  # 10% de chance de alerta
-            alerts.append({
-                "type": "warning",
-                "message": "Reservas de USDT estão baixas",
-                "severity": "medium",
-                "timestamp": datetime.utcnow().isoformat()
-            })
-        
-        system_health = "healthy" if len(alerts) == 0 else "warning"
-        if any(alert["severity"] == "high" for alert in alerts):
-            system_health = "critical"
+        if 'stablecoinFactory' in data:
+            CONTRACTS["STABLECOIN_FACTORY"] = data['stablecoinFactory']
         
         return jsonify({
-            "success": True,
-            "data": {
-                "system_health": system_health,
-                "alerts": alerts,
-                "last_check": datetime.utcnow().isoformat(),
-                "bsc_connected": w3.is_connected() if w3 else False,
-                "contracts_configured": bool(BRZSTABLE_ADDRESS and MOCKUSDT_ADDRESS)
-            }
+            "status": "success",
+            "message": "Endereços atualizados com sucesso",
+            "contracts": CONTRACTS
         })
         
     except Exception as e:
-        logger.error(f"Erro em monitor_system: {str(e)}")
+        logging.error(f"Erro ao atualizar contratos: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@automation_bp.route('/networks/supported', methods=['GET'])
+def get_supported_networks():
+    """Lista redes suportadas"""
+    try:
+        networks = [
+            {
+                "chainId": 97,
+                "name": "BSC Testnet",
+                "rpcUrl": "https://data-seed-prebsc-1-s1.bnbchain.org:8545",
+                "explorer": "https://testnet.bscscan.com",
+                "nativeCurrency": "tBNB",
+                "isActive": True,
+                "dex": {
+                    "name": "PancakeSwap",
+                    "factory": "0x6725F303b657a9451d8BA641348b6761A6CC7a17",
+                    "router": "0xD99D1c33F9fC3444f8101754aBC46c52416550D1"
+                }
+            }
+        ]
+        
         return jsonify({
-            "success": False,
-            "error": f"Erro interno: {str(e)}"
-        }), 500
+            "status": "success",
+            "networks": networks,
+            "totalNetworks": len(networks)
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao obter redes: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
